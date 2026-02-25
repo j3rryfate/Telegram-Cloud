@@ -1,28 +1,53 @@
-// ... အပေါ်ပိုင်း အရင်အတိုင်း (import, mongoose, etc.)
+// server.js
+import express from 'express';
+import { TelegramClient, Api } from 'telegram';
+import { StringSession } from 'telegram/sessions/index.js';
+import mongoose from 'mongoose';
+import dotenv from 'dotenv';
+import cors from 'cors';
 
-let tempClient; // တစ်ခါတည်း သုံးမယ့် client (concurrent များရင် ပိုကောင်းအောင် ပြင်ဆင်နိုင်ပါတယ်)
+dotenv.config();
 
-// 1. Send OTP (မပြောင်းပါ)
+const app = express();  // ← ဒီ line က အရေးကြီးဆုံး! မရှိရင် app မရှိဘူး ဆိုပြီး error ထွက်တယ်
+
+app.use(express.json());
+app.use(cors());
+app.use(express.static('public'));
+
+// MongoDB Setup
+mongoose.connect(process.env.MONGO_URL)
+    .then(() => console.log("✅ MongoDB Connected"))
+    .catch(err => console.error("MongoDB connection error:", err));
+
+const UserSchema = new mongoose.Schema({
+    phoneNumber: String,
+    sessionString: String
+});
+const User = mongoose.model('User', UserSchema);
+
+const apiId = parseInt(process.env.API_ID);
+const apiHash = process.env.API_HASH;
+
+let tempClient;  // temporary client for login flow
+
+// 1. Send OTP
 app.post('/api/auth/send-code', async (req, res) => {
     try {
         const { phone } = req.body;
 
         tempClient = new TelegramClient(new StringSession(""), apiId, apiHash, {
             connectionRetries: 5,
-            deviceModel: "TG Cloud Web",
+            deviceModel: "TG Cloud Web"
         });
 
         await tempClient.connect();
 
-        const sentCode = await tempClient.sendCode(
-            { apiId, apiHash },
-            phone
-        );
+        const sentCode = await tempClient.sendCode({ apiId, apiHash }, phone);
 
         res.json({
             success: true,
             phoneCodeHash: sentCode.phoneCodeHash,
-            phone,
+            phone
         });
     } catch (err) {
         console.error("Send Code Error:", err);
@@ -30,7 +55,7 @@ app.post('/api/auth/send-code', async (req, res) => {
     }
 });
 
-// 2. Verify OTP → 2FA လိုအပ်မလိုအပ် စစ်ဆေး
+// 2. Verify OTP
 app.post('/api/auth/verify-code', async (req, res) => {
     try {
         const { phone, code, phoneCodeHash } = req.body;
@@ -40,14 +65,13 @@ app.post('/api/auth/verify-code', async (req, res) => {
         }
 
         try {
-            // OTP နဲ့ sign in ကြိုးစား
             await tempClient.signIn({
                 phoneNumber: phone,
                 phoneCodeHash,
                 phoneCode: code,
             });
 
-            // ဒီနေရာရောက်ရင် 2FA မလိုပဲ login အောင်မြင်ပြီ
+            // No 2FA needed → save session
             const sessionString = tempClient.session.save();
             await User.findOneAndUpdate(
                 { phoneNumber: phone },
@@ -55,17 +79,16 @@ app.post('/api/auth/verify-code', async (req, res) => {
                 { upsert: true }
             );
 
-            tempClient.destroy(); // ရှင်းပစ်ပါ
+            tempClient.destroy();
             tempClient = null;
 
-            return res.json({ success: true, message: "Login အောင်မြင်ပါပြီ (2FA မလို)" });
+            return res.json({ success: true, message: "Login အောင်မြင်ပါပြီ (no 2FA)" });
         } catch (err) {
             if (err.errorMessage === 'SESSION_PASSWORD_NEEDED') {
-                // 2FA လိုအပ်တယ် → frontend ကို password ထည့်ခိုင်းပါ
                 return res.json({
                     success: false,
                     requiresPassword: true,
-                    message: "2FA password လိုအပ်ပါသည်",
+                    message: "2FA password လိုအပ်ပါသည်"
                 });
             }
 
@@ -74,7 +97,7 @@ app.post('/api/auth/verify-code', async (req, res) => {
             }
 
             console.error("SignIn Error:", err);
-            throw err;
+            res.status(500).json({ error: err.message });
         }
     } catch (err) {
         console.error("Verify Code Error:", err);
@@ -82,7 +105,7 @@ app.post('/api/auth/verify-code', async (req, res) => {
     }
 });
 
-// 3. Verify 2FA Password → အပြီးသတ် login
+// 3. Verify 2FA Password (using client.start with password callback)
 app.post('/api/auth/verify-password', async (req, res) => {
     try {
         const { phone, password } = req.body;
@@ -91,16 +114,11 @@ app.post('/api/auth/verify-password', async (req, res) => {
             return res.status(400).json({ error: "Session မရှိတော့ပါ။ အစကနေ ပြန်စပါ" });
         }
 
-        // GramJS မှာ password ကို တိုက်ရိုက် သုံးပြီး check လုပ်နိုင်တယ်
-        // ဒီနေရာမှာ client.start() ကို ဆက်သုံးလို့ ရပါတယ် (password callback နဲ့)
         await tempClient.start({
             phoneNumber: async () => phone,
-            phoneCode: async () => { throw new Error("Code မလိုတော့ပါ"); }, // မသုံးတော့ဘူး
-            password: async () => password,  // ဒီနေရာက အဓိက
-            onError: (err) => {
-                console.error("Start error during 2FA:", err);
-                throw err;
-            },
+            phoneCode: async () => { throw new Error("Code မလိုတော့ပါ"); }, // dummy, since we already passed code
+            password: async () => password,
+            onError: (err) => { throw err; }
         });
 
         const sessionString = tempClient.session.save();
@@ -118,7 +136,7 @@ app.post('/api/auth/verify-password', async (req, res) => {
     } catch (err) {
         console.error("2FA Verify Error:", err);
 
-        if (err.errorMessage?.includes('PASSWORD_HASH_INVALID') || err.message?.includes('Invalid')) {
+        if (err.errorMessage?.includes('PASSWORD_HASH_INVALID') || err.message?.toLowerCase().includes('password')) {
             return res.status(400).json({ error: "2FA password မမှန်ပါ" });
         }
 
@@ -126,7 +144,11 @@ app.post('/api/auth/verify-password', async (req, res) => {
     }
 });
 
-// ကျန်တဲ့ endpoint တွေ (files, download) က အရင်အတိုင်း ဆက်ထားပါ
-// ဒါပေမယ့် client အသစ်ဖန်တီးတိုင်း session ကနေ သုံးနေတာမို့ အဆင်ပြေပါတယ်။
+// ကျန်တဲ့ endpoints (files, download) ကို လိုအပ်ရင် ဆက်ထည့်ပါ
+// ဥပမာ:
+// app.get('/api/files', async (req, res) => { ... });
 
-// ... app.listen အဆုံး
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, () => {
+    console.log(`🚀 Server running on port ${PORT}`);
+});
