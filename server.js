@@ -11,6 +11,7 @@ app.use(express.json());
 app.use(cors());
 app.use(express.static('public'));
 
+// MongoDB Setup
 mongoose.connect(process.env.MONGO_URL).then(() => console.log("✅ MongoDB Connected"));
 
 const UserSchema = new mongoose.Schema({ phoneNumber: String, sessionString: String });
@@ -19,17 +20,20 @@ const User = mongoose.model('User', UserSchema);
 const apiId = parseInt(process.env.API_ID);
 const apiHash = process.env.API_HASH;
 let tempClient;
+let savedPhone, savedPhoneCodeHash, savedOTP; // Temporary state storage
 
 // 1. Send OTP
 app.post('/api/auth/send-code', async (req, res) => {
     try {
         const { phone } = req.body;
+        savedPhone = phone;
         tempClient = new TelegramClient(new StringSession(""), apiId, apiHash, { 
             connectionRetries: 5,
             deviceModel: "TG Cloud Web"
         });
         await tempClient.connect();
         const { phoneCodeHash } = await tempClient.sendCode({ apiId, apiHash }, phone);
+        savedPhoneCodeHash = phoneCodeHash;
         res.json({ success: true, phoneCodeHash, phone });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -40,23 +44,23 @@ app.post('/api/auth/send-code', async (req, res) => {
 app.post('/api/auth/verify-code', async (req, res) => {
     try {
         const { phone, code, phoneCodeHash } = req.body;
-        
+        savedOTP = code; // Password verify လုပ်တဲ့အခါ ပြန်သုံးဖို့ သိမ်းထားရပါမယ်
+
         try {
-            await tempClient.invoke(
-                new Api.auth.SignIn({
-                    phoneNumber: phone,
-                    phoneCodeHash: phoneCodeHash,
-                    phoneCode: code,
-                })
-            );
+            await tempClient.signIn({
+                phoneNumber: phone,
+                phoneCodeHash: phoneCodeHash,
+                phoneCode: code,
+                // Password တောင်းလာခဲ့ရင် Error ပေးပြီး catch ထဲကို ပို့မယ်
+                password: async () => { throw new Error("SESSION_PASSWORD_NEEDED") }
+            });
             
             const sessionString = tempClient.session.save();
             await User.findOneAndUpdate({ phoneNumber: phone }, { sessionString }, { upsert: true });
             return res.json({ success: true });
 
         } catch (err) {
-            // Error Message ထဲမှာ 2FA လိုအပ်ကြောင်းပါလျှင်
-            if (err.errorMessage === 'SESSION_PASSWORD_NEEDED') {
+            if (err.message === "SESSION_PASSWORD_NEEDED" || err.errorMessage === 'SESSION_PASSWORD_NEEDED') {
                 return res.json({ success: false, requiresPassword: true });
             }
             throw err;
@@ -66,17 +70,17 @@ app.post('/api/auth/verify-code', async (req, res) => {
     }
 });
 
-// 3. Verify 2FA Password (Error Fix: Manual SRP Verification)
+// 3. Verify 2FA Password (Manual Flow to avoid 'Code is empty' error)
 app.post('/api/auth/verify-password', async (req, res) => {
     try {
         const { password, phone } = req.body;
         
-        // GramJS ရဲ့ start function ကို password verify လုပ်ဖို့ သုံးရပါမယ်
-        // ဒါမှသာ signInUserPassword error ကင်းမှာဖြစ်ပါတယ်
-        await tempClient.start({
-            phoneNumber: async () => phone,
+        // Manual Login using phone, code and password
+        await tempClient.signIn({
+            phoneNumber: savedPhone,
+            phoneCodeHash: savedPhoneCodeHash,
+            phoneCode: savedOTP,
             password: async () => password,
-            onError: (err) => { throw err; }
         });
 
         const sessionString = tempClient.session.save();
@@ -85,7 +89,7 @@ app.post('/api/auth/verify-password', async (req, res) => {
         res.json({ success: true });
     } catch (err) {
         console.error("2FA Error:", err);
-        res.status(500).json({ error: "Password စစ်ဆေးစဉ် အမှားအယွင်းရှိခဲ့သည်။ " + err.message });
+        res.status(500).json({ error: "Password မှားနေပါသည် သို့မဟုတ် Session ကုန်ဆုံးသွားပါပြီ။" });
     }
 });
 
