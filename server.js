@@ -11,7 +11,7 @@ app.use(express.json());
 app.use(cors());
 app.use(express.static('public'));
 
-// MongoDB Setup
+// MongoDB Connection
 mongoose.connect(process.env.MONGO_URL).then(() => console.log("✅ MongoDB Connected"));
 
 const UserSchema = new mongoose.Schema({ phoneNumber: String, sessionString: String });
@@ -19,87 +19,97 @@ const User = mongoose.model('User', UserSchema);
 
 const apiId = parseInt(process.env.API_ID);
 const apiHash = process.env.API_HASH;
-let tempClient;
-let savedPhone, savedPhoneCodeHash, savedOTP; // Temporary state storage
 
-// 1. Send OTP
+// Login လုပ်နေစဉ် state ကို ယာယီသိမ်းထားရန်
+let tempClient;
+let authData = { phone: '', phoneCodeHash: '', otp: '' };
+
+// 1. OTP ပို့ခြင်း
 app.post('/api/auth/send-code', async (req, res) => {
     try {
         const { phone } = req.body;
-        savedPhone = phone;
+        authData.phone = phone;
+        
         tempClient = new TelegramClient(new StringSession(""), apiId, apiHash, { 
             connectionRetries: 5,
             deviceModel: "TG Cloud Web"
         });
+        
         await tempClient.connect();
-        const { phoneCodeHash } = await tempClient.sendCode({ apiId, apiHash }, phone);
-        savedPhoneCodeHash = phoneCodeHash;
-        res.json({ success: true, phoneCodeHash, phone });
+        const result = await tempClient.sendCode({ apiId, apiHash }, phone);
+        authData.phoneCodeHash = result.phoneCodeHash;
+        
+        res.json({ success: true });
     } catch (err) {
+        console.error(err);
         res.status(500).json({ error: err.message });
     }
 });
 
-// 2. Verify OTP & Handle 2FA
+// 2. OTP စစ်ဆေးခြင်း နှင့် 2FA ရှိမရှိ စစ်ခြင်း
 app.post('/api/auth/verify-code', async (req, res) => {
     try {
-        const { phone, code, phoneCodeHash } = req.body;
-        savedOTP = code; // Password verify လုပ်တဲ့အခါ ပြန်သုံးဖို့ သိမ်းထားရပါမယ်
+        const { code } = req.body;
+        authData.otp = code;
 
         try {
-            await tempClient.signIn({
-                phoneNumber: phone,
-                phoneCodeHash: phoneCodeHash,
-                phoneCode: code,
-                // Password တောင်းလာခဲ့ရင် Error ပေးပြီး catch ထဲကို ပို့မယ်
-                password: async () => { throw new Error("SESSION_PASSWORD_NEEDED") }
-            });
+            // Manual SignIn invoke ကို သုံးခြင်းက အမှားအယွင်း အနည်းဆုံးဖြစ်သည်
+            await tempClient.invoke(
+                new Api.auth.SignIn({
+                    phoneNumber: authData.phone,
+                    phoneCodeHash: authData.phoneCodeHash,
+                    phoneCode: authData.otp,
+                })
+            );
             
+            // Success (No 2FA)
             const sessionString = tempClient.session.save();
-            await User.findOneAndUpdate({ phoneNumber: phone }, { sessionString }, { upsert: true });
-            return res.json({ success: true });
+            await User.findOneAndUpdate({ phoneNumber: authData.phone }, { sessionString }, { upsert: true });
+            res.json({ success: true });
 
         } catch (err) {
-            if (err.message === "SESSION_PASSWORD_NEEDED" || err.errorMessage === 'SESSION_PASSWORD_NEEDED') {
+            // 2FA Password လိုအပ်ပါက
+            if (err.errorMessage === 'SESSION_PASSWORD_NEEDED') {
                 return res.json({ success: false, requiresPassword: true });
             }
             throw err;
         }
     } catch (err) {
-        res.status(500).json({ error: "OTP Error: " + err.message });
+        res.status(500).json({ error: err.message });
     }
 });
 
-// 3. Verify 2FA Password (Manual Flow to avoid 'Code is empty' error)
+// 3. 2FA Password စစ်ဆေးခြင်း
 app.post('/api/auth/verify-password', async (req, res) => {
     try {
-        const { password, phone } = req.body;
+        const { password } = req.body;
         
-        // Manual Login using phone, code and password
+        // GramJS ၏ signIn function ကို password စစ်ရန် သုံးသည်
         await tempClient.signIn({
-            phoneNumber: savedPhone,
-            phoneCodeHash: savedPhoneCodeHash,
-            phoneCode: savedOTP,
+            phoneNumber: authData.phone,
             password: async () => password,
+            phoneCode: async () => authData.otp,
+            phoneCodeHash: async () => authData.phoneCodeHash,
+            onError: (err) => { throw err; }
         });
 
         const sessionString = tempClient.session.save();
-        await User.findOneAndUpdate({ phoneNumber: phone }, { sessionString }, { upsert: true });
-
+        await User.findOneAndUpdate({ phoneNumber: authData.phone }, { sessionString }, { upsert: true });
         res.json({ success: true });
     } catch (err) {
-        console.error("2FA Error:", err);
-        res.status(500).json({ error: "Password မှားနေပါသည် သို့မဟုတ် Session ကုန်ဆုံးသွားပါပြီ။" });
+        res.status(500).json({ error: "Password မှားယွင်းနေပါသည်။ " + err.message });
     }
 });
 
-// --- File Stream Routes ---
+// 4. ဖိုင်များဆွဲထုတ်ခြင်း (Streaming)
 app.get('/api/files', async (req, res) => {
     try {
         const user = await User.findOne();
-        if (!user) return res.status(401).json({ error: "Please login!" });
+        if (!user) return res.status(401).json({ error: "Please login first!" });
+
         const client = new TelegramClient(new StringSession(user.sessionString), apiId, apiHash, {});
         await client.connect();
+        
         const messages = await client.getMessages(process.env.CHAT_ID, { limit: 50 });
         const files = messages.filter(m => m.media).map(m => ({
             id: m.id,
@@ -110,14 +120,18 @@ app.get('/api/files', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// 5. Download Streaming
 app.get('/api/download/:msgId', async (req, res) => {
     try {
         const user = await User.findOne();
         const client = new TelegramClient(new StringSession(user.sessionString), apiId, apiHash, {});
         await client.connect();
+        
         const msgId = parseInt(req.params.msgId);
         const messages = await client.getMessages(process.env.CHAT_ID, { ids: [msgId] });
         
+        if (!messages[0] || !messages[0].media) return res.status(404).send("File not found");
+
         res.setHeader('Content-Type', 'application/octet-stream');
         for await (const chunk of client.iterDownload({ file: messages[0].media, chunkSize: 512 * 1024 })) {
             res.write(chunk);
@@ -127,4 +141,4 @@ app.get('/api/download/:msgId', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log(`🚀 Server ready on ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
