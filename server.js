@@ -36,7 +36,7 @@ app.post('/api/auth/send-code', async (req, res) => {
     }
 });
 
-// 2. Verify OTP & Detect 2FA
+// 2. Verify OTP & Handle 2FA
 app.post('/api/auth/verify-code', async (req, res) => {
     try {
         const { phone, code, phoneCodeHash } = req.body;
@@ -55,29 +55,29 @@ app.post('/api/auth/verify-code', async (req, res) => {
             return res.json({ success: true });
 
         } catch (err) {
-            // 2FA Password လိုအပ်ပါက ဤနေရာတွင် သိရှိနိုင်သည်
+            // Error Message ထဲမှာ 2FA လိုအပ်ကြောင်းပါလျှင်
             if (err.errorMessage === 'SESSION_PASSWORD_NEEDED') {
                 return res.json({ success: false, requiresPassword: true });
             }
             throw err;
         }
     } catch (err) {
-        console.error("OTP Error:", err.message);
-        res.status(500).json({ error: "OTP ကုဒ်မှားယွင်းနေပါသည်။ " + err.message });
+        res.status(500).json({ error: "OTP Error: " + err.message });
     }
 });
 
-// 3. Verify 2FA Password (Manual Flow)
+// 3. Verify 2FA Password (Error Fix: Manual SRP Verification)
 app.post('/api/auth/verify-password', async (req, res) => {
     try {
         const { password, phone } = req.body;
         
-        // 2FA Password Verification
-        const passwordInfo = await tempClient.invoke(new Api.account.GetPassword());
-        const { srp_id, current_algo, srp_B } = passwordInfo;
-        
-        // GramJS ရဲ့ helper function ကို password verify လုပ်ဖို့ သုံးပါတယ်
-        await tempClient.signInUserPassword(password);
+        // GramJS ရဲ့ start function ကို password verify လုပ်ဖို့ သုံးရပါမယ်
+        // ဒါမှသာ signInUserPassword error ကင်းမှာဖြစ်ပါတယ်
+        await tempClient.start({
+            phoneNumber: async () => phone,
+            password: async () => password,
+            onError: (err) => { throw err; }
+        });
 
         const sessionString = tempClient.session.save();
         await User.findOneAndUpdate({ phoneNumber: phone }, { sessionString }, { upsert: true });
@@ -85,11 +85,11 @@ app.post('/api/auth/verify-password', async (req, res) => {
         res.json({ success: true });
     } catch (err) {
         console.error("2FA Error:", err);
-        res.status(500).json({ error: "Password မှားနေပါသည်။ " + err.message });
+        res.status(500).json({ error: "Password စစ်ဆေးစဉ် အမှားအယွင်းရှိခဲ့သည်။ " + err.message });
     }
 });
 
-// --- File Stream Route ---
+// --- File Stream Routes ---
 app.get('/api/files', async (req, res) => {
     try {
         const user = await User.findOne();
@@ -113,10 +113,9 @@ app.get('/api/download/:msgId', async (req, res) => {
         await client.connect();
         const msgId = parseInt(req.params.msgId);
         const messages = await client.getMessages(process.env.CHAT_ID, { ids: [msgId] });
-        const message = messages[0];
         
         res.setHeader('Content-Type', 'application/octet-stream');
-        for await (const chunk of client.iterDownload({ file: message.media, chunkSize: 512 * 1024 })) {
+        for await (const chunk of client.iterDownload({ file: messages[0].media, chunkSize: 512 * 1024 })) {
             res.write(chunk);
         }
         res.end();
@@ -124,4 +123,4 @@ app.get('/api/download/:msgId', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log(`🚀 Server ready on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Server ready on ${PORT}`));
