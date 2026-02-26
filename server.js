@@ -19,62 +19,47 @@ const User = mongoose.model('User', UserSchema);
 const apiId = parseInt(process.env.API_ID);
 const apiHash = process.env.API_HASH;
 
-let tempClient = null;
-let authData = { phone: '', phoneCodeHash: '', otp: '' };
+let activeClient = null;
+let loginData = { phone: '', phoneCodeHash: '', otp: '' };
 
-// Telegram Client ကို တည်ငြိမ်စွာ ဆောက်ပေးမည့် Helper Function
-const createClient = (session = "") => {
+// Client creation helper
+const getClient = (session = "") => {
     return new TelegramClient(new StringSession(session), apiId, apiHash, {
-        connectionRetries: 10,
-        useWSS: false, // InvalidBufferError ကို ကျော်လွှားရန် WSS ပိတ်ထားသည်
-        testMode: false,
-        deviceModel: "TG Cloud Web",
+        connectionRetries: 15,
+        useWSS: false, // Network error ရှောင်ရန်
+        deviceModel: "TG Cloud Production",
     });
 };
 
-// 1. Send OTP
 app.post('/api/auth/send-code', async (req, res) => {
     try {
         const { phone } = req.body;
-        authData.phone = phone;
-        
-        tempClient = createClient();
-        
-        // Error logs များကို သေချာဖမ်းရန်
-        await tempClient.connect();
-        
-        const result = await tempClient.sendCode({ apiId, apiHash }, phone);
-        authData.phoneCodeHash = result.phoneCodeHash;
-        
+        loginData.phone = phone;
+        activeClient = getClient();
+        await activeClient.connect();
+        const result = await activeClient.sendCode({ apiId, apiHash }, phone);
+        loginData.phoneCodeHash = result.phoneCodeHash;
         res.json({ success: true });
     } catch (err) {
-        console.error("Connection Error:", err);
-        res.status(500).json({ error: "Telegram Connection ကျရှုံးပါသည်။ ခဏနားပြီးမှ ပြန်စမ်းပါ။ " + err.message });
+        res.status(500).json({ error: err.message });
     }
 });
 
-// 2. Verify OTP & Detect 2FA
 app.post('/api/auth/verify-code', async (req, res) => {
     try {
         const { code } = req.body;
-        authData.otp = code;
-
+        loginData.otp = code;
         try {
-            await tempClient.invoke(
-                new Api.auth.SignIn({
-                    phoneNumber: authData.phone,
-                    phoneCodeHash: authData.phoneCodeHash,
-                    phoneCode: authData.otp,
-                })
-            );
-            
-            const sessionString = tempClient.session.save();
-            await User.findOneAndUpdate({ phoneNumber: authData.phone }, { sessionString }, { upsert: true });
+            await activeClient.invoke(new Api.auth.SignIn({
+                phoneNumber: loginData.phone,
+                phoneCodeHash: loginData.phoneCodeHash,
+                phoneCode: loginData.otp,
+            }));
+            const sessionString = activeClient.session.save();
+            await User.findOneAndUpdate({ phoneNumber: loginData.phone }, { sessionString }, { upsert: true });
             res.json({ success: true });
         } catch (err) {
-            if (err.errorMessage === 'SESSION_PASSWORD_NEEDED') {
-                return res.json({ success: false, requiresPassword: true });
-            }
+            if (err.errorMessage === 'SESSION_PASSWORD_NEEDED') return res.json({ success: false, requiresPassword: true });
             throw err;
         }
     } catch (err) {
@@ -82,57 +67,47 @@ app.post('/api/auth/verify-code', async (req, res) => {
     }
 });
 
-// 3. Verify 2FA Password
 app.post('/api/auth/verify-password', async (req, res) => {
     try {
         const { password } = req.body;
-        await tempClient.signInUserPassword(password);
-
-        const sessionString = tempClient.session.save();
-        await User.findOneAndUpdate({ phoneNumber: authData.phone }, { sessionString }, { upsert: true });
+        await activeClient.start({
+            phoneNumber: async () => loginData.phone,
+            password: async () => password,
+            phoneCode: async () => loginData.otp,
+            onError: (err) => { throw err; }
+        });
+        const sessionString = activeClient.session.save();
+        await User.findOneAndUpdate({ phoneNumber: loginData.phone }, { sessionString }, { upsert: true });
         res.json({ success: true });
     } catch (err) {
-        res.status(500).json({ error: "Password မှားနေပါသည်။" });
+        res.status(500).json({ error: err.message });
     }
 });
 
-// 4. File Management & Stream Download
+// Files list & Download Streaming
 app.get('/api/files', async (req, res) => {
     try {
         const user = await User.findOne();
-        if (!user) return res.status(401).json({ error: "Please login first!" });
-        
-        const client = createClient(user.sessionString);
+        if (!user) return res.status(401).json({ error: "No Login Found" });
+        const client = getClient(user.sessionString);
         await client.connect();
-        
         const messages = await client.getMessages(process.env.CHAT_ID, { limit: 50 });
-        const files = messages.filter(m => m.media).map(m => ({
-            id: m.id,
-            text: m.message || "File Attached",
-            date: m.date
-        }));
-        res.json(files);
+        res.json(messages.filter(m => m.media).map(m => ({ id: m.id, text: m.message || "File", date: m.date })));
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.get('/api/download/:msgId', async (req, res) => {
     try {
         const user = await User.findOne();
-        const client = createClient(user.sessionString);
+        const client = getClient(user.sessionString);
         await client.connect();
-        
         const msgId = parseInt(req.params.msgId);
         const messages = await client.getMessages(process.env.CHAT_ID, { ids: [msgId] });
-        
-        if (!messages[0] || !messages[0].media) return res.status(404).send("File not found");
-
         res.setHeader('Content-Type', 'application/octet-stream');
-        for await (const chunk of client.iterDownload({ file: messages[0].media, chunkSize: 512 * 1024 })) {
-            res.write(chunk);
-        }
+        for await (const chunk of client.iterDownload({ file: messages[0].media, chunkSize: 512 * 1024 })) res.write(chunk);
         res.end();
     } catch (err) { res.status(500).send(err.message); }
 });
 
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log(`🚀 Server ready on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Production Server on port ${PORT}`));
