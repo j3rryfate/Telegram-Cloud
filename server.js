@@ -22,12 +22,16 @@ const apiHash = process.env.API_HASH;
 let activeClient = null;
 let loginData = { phone: '', phoneCodeHash: '', otp: '' };
 
-// Client creation helper
+// Client Creation Helper (Network Fix ပါဝင်သည်)
 const getClient = (session = "") => {
     return new TelegramClient(new StringSession(session), apiId, apiHash, {
         connectionRetries: 15,
-        useWSS: false, // Network error ရှောင်ရန်
-        deviceModel: "TG Cloud Production",
+        useWSS: false, // အရေးကြီးသည်- InvalidBufferError ကို ဖြေရှင်းရန်
+        autoReconnect: true,
+        deviceModel: "TG Cloud Desktop",
+        systemVersion: "4.16.30-vxGI",
+        appVersion: "1.0.0",
+        testMode: false
     });
 };
 
@@ -35,16 +39,22 @@ app.post('/api/auth/send-code', async (req, res) => {
     try {
         const { phone } = req.body;
         loginData.phone = phone;
+        
         activeClient = getClient();
+        
+        // Connect မလုပ်ခင် ယာယီ စောင့်ဆိုင်းခြင်း (Server overload မဖြစ်စေရန်)
         await activeClient.connect();
+        
         const result = await activeClient.sendCode({ apiId, apiHash }, phone);
         loginData.phoneCodeHash = result.phoneCodeHash;
         res.json({ success: true });
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        console.error("Connection Error:", err);
+        res.status(500).json({ error: "Network Error: Telegram Server နှင့် ချိတ်ဆက်မရပါ။ " + err.message });
     }
 });
 
+// Verify OTP & Verify Password routes များကို အရင်အတိုင်း ထားနိုင်ပါသည်။
 app.post('/api/auth/verify-code', async (req, res) => {
     try {
         const { code } = req.body;
@@ -84,7 +94,7 @@ app.post('/api/auth/verify-password', async (req, res) => {
     }
 });
 
-// Files list & Download Streaming
+// File list & Download Streaming အပိုင်း
 app.get('/api/files', async (req, res) => {
     try {
         const user = await User.findOne();
@@ -110,4 +120,4 @@ app.get('/api/download/:msgId', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log(`🚀 Production Server on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Final Production Server on port ${PORT}`));
